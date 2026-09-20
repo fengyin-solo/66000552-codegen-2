@@ -11,6 +11,16 @@ ACTIVE_CLIENTS = []
 SIM_RUNNING = True
 current_price = 100.0
 ticks_history = []
+fills_history = []
+tick_seq = 0
+fill_seq = 0
+
+# 实时网格状态（可由前端通过 WS 同步），曲线、轨道、成交点共用同一份数据
+state_lock = threading.Lock()
+GRID = {"lowerPrice": 95.0, "upperPrice": 115.0, "gridCount": 20, "capitalPerGrid": 1000.0}
+# holdings: 网格档位索引 -> 持仓数量
+holdings = {}
+
 
 class GridConfig(BaseModel):
     lowerPrice: float = 95
@@ -20,40 +30,94 @@ class GridConfig(BaseModel):
     initialCapital: float = 100000
 
 
-def simulate_market():
-    global current_price, ticks_history
+def simulate_fills(price, prev_price, ts, seq):
+    """价格穿越网格档位时产生成交：下穿买入，回到半格止盈位卖出。"""
+    global fill_seq
+    new_fills = []
+    with state_lock:
+        # 在同一把锁内取网格快照并生成成交，避免与配置更新交错
+        step = (GRID["upperPrice"] - GRID["lowerPrice"]) / GRID["gridCount"]
+        levels = [GRID["lowerPrice"] + i * step for i in range(GRID["gridCount"] + 1)]
+        capital = GRID["capitalPerGrid"]
+        for i, gp in enumerate(levels[:-1]):
+            if prev_price > gp >= price and i not in holdings:
+                qty = round(capital / gp, 2)
+                holdings[i] = qty
+                fill_seq += 1
+                new_fills.append({"id": fill_seq, "tickSeq": seq, "time": ts,
+                                  "side": "BUY", "price": round(gp, 2), "quantity": qty})
+                continue
+            sell_trigger = gp + step * 0.5
+            if prev_price < sell_trigger <= price and i in holdings:
+                qty = holdings.pop(i)
+                fill_seq += 1
+                new_fills.append({"id": fill_seq, "tickSeq": seq, "time": ts,
+                                  "side": "SELL", "price": round(sell_trigger, 2), "quantity": qty})
+    return new_fills
+
+
+def simulate_market(loop):
+    global current_price, ticks_history, fills_history, tick_seq
     price = 100.0
+    prev_price = price
     while SIM_RUNNING:
         drift = 0.005 * math.sin(time.time() * 0.05)
         price += random.gauss(drift, 0.3)
         price = max(80, min(130, price))
         current_price = price
-        tick = {
-            "time": time.strftime("%H:%M:%S"),
-            "price": round(price, 2),
-            "bid": round(price - random.uniform(0.01, 0.05), 2),
-            "ask": round(price + random.uniform(0.01, 0.05), 2),
-            "volume": random.randint(100, 5000)
-        }
-        ticks_history.append(tick)
-        if len(ticks_history) > 200:
-            ticks_history = ticks_history[-200:]
+        ts = time.strftime("%H:%M:%S")
+        with state_lock:
+            tick_seq += 1
+            seq = tick_seq
+            tick = {
+                "seq": seq,
+                "time": ts,
+                "price": round(price, 2),
+                "bid": round(price - random.uniform(0.01, 0.05), 2),
+                "ask": round(price + random.uniform(0.01, 0.05), 2),
+                "volume": random.randint(100, 5000)
+            }
+            ticks_history.append(tick)
+            if len(ticks_history) > 200:
+                ticks_history = ticks_history[-200:]
+
+        # 成交点与报价同帧生成，保证曲线与叠加点来自同一数据源
+        new_fills = simulate_fills(price, prev_price, ts, seq)
+        prev_price = price
+        if new_fills:
+            with state_lock:
+                fills_history.extend(new_fills)
+                if len(fills_history) > 60:
+                    fills_history = fills_history[-60:]
 
         # Order book
         bids = [[round(price - 0.01 * i, 2), random.randint(100, 1000)] for i in range(1, 11)]
         asks = [[round(price + 0.01 * i, 2), random.randint(100, 1000)] for i in range(1, 11)]
         order_book = {"bids": bids, "asks": asks, "midPrice": price, "spread": round(asks[0][0] - bids[0][0], 2)}
 
-        payload = json.dumps({"ticks": ticks_history[-60:], "orderBook": order_book})
-        for ws in ACTIVE_CLIENTS:
-            try: asyncio.run_coroutine_threadsafe(ws.send_text(payload), asyncio.get_event_loop())
-            except: pass
+        with state_lock:
+            # 只重放落在当前报价窗口内的成交，保证叠加点始终能对齐到曲线
+            win_start = ticks_history[-60:][0]["seq"] if ticks_history[-60:] else 0
+            window_fills = [f for f in fills_history if f["tickSeq"] >= win_start]
+            payload = json.dumps({
+                "ticks": ticks_history[-60:],
+                "fills": window_fills[-60:],
+                "orderBook": order_book,
+                "grid": {"lowerPrice": GRID["lowerPrice"], "upperPrice": GRID["upperPrice"],
+                         "gridCount": GRID["gridCount"]}
+            })
+        for ws in list(ACTIVE_CLIENTS):
+            try:
+                asyncio.run_coroutine_threadsafe(ws.send_text(payload), loop)
+            except Exception:
+                pass
         time.sleep(0.5)
 
 
 @app.on_event("startup")
 async def startup():
-    threading.Thread(target=simulate_market, daemon=True).start()
+    loop = asyncio.get_event_loop()
+    threading.Thread(target=simulate_market, args=(loop,), daemon=True).start()
 
 
 @app.post("/api/backtest")
@@ -106,7 +170,7 @@ def run_backtest(config: GridConfig):
     return_rate = (total_profit / config.initialCapital) * 100
 
     # Sharpe ratio
-    eq_returns = np.diff(equity_curve) / np.array(equity_curve[:-1] + 1e-5)
+    eq_returns = np.diff(equity_curve) / (np.array(equity_curve[:-1], dtype=float) + 1e-5)
     sharpe = float(np.mean(eq_returns) / max(np.std(eq_returns), 1e-5) * np.sqrt(252)) if len(eq_returns) > 1 else 0
 
     # Max drawdown
@@ -138,6 +202,26 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     ACTIVE_CLIENTS.append(ws)
     try:
-        while True: await ws.receive_text()
-    except: 
-        if ws in ACTIVE_CLIENTS: ACTIVE_CLIENTS.remove(ws)
+        while True:
+            msg = await ws.receive_text()
+            # 前端把当前网格配置推过来，实时上下轨与成交模拟随之更新
+            try:
+                d = json.loads(msg)
+                lower = float(d["lowerPrice"])
+                upper = float(d["upperPrice"])
+                count = int(d["gridCount"])
+                if lower < upper and count > 0:
+                    with state_lock:
+                        GRID["lowerPrice"] = lower
+                        GRID["upperPrice"] = upper
+                        GRID["gridCount"] = count
+                        if d.get("capitalPerGrid"):
+                            GRID["capitalPerGrid"] = float(d["capitalPerGrid"])
+                        holdings.clear()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)
